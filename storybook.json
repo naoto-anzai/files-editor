@@ -2,6 +2,22 @@
   "version": 1,
   "props": {},
   "states": [
-    { "key": "compact", "label": "コンパクト表示", "kind": "switch", "default": false }
+    {
+      "key": "status",
+      "label": "保存状態",
+      "about": "ヘッダーのバッジ・マシン名・バナーが変わる",
+      "kind": "radio",
+      "options": [
+        { "value": "clean", "label": "保存済み" },
+        { "value": "dirty", "label": "未保存" },
+        { "value": "conflict", "label": "競合(ディスクが変更)" },
+        { "value": "deleted", "label": "競合(ディスクから削除)" },
+        { "value": "saveError", "label": "保存失敗" },
+        { "value": "remote", "label": "リモート(マシン名つき・編集中)" },
+        { "value": "error", "label": "読み込み失敗" },
+        { "value": "empty", "label": "ファイル未指定" }
+      ],
+      "default": "clean"
+    }
   ]
 }
