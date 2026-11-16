@@ -12,6 +12,7 @@
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
 import { theme, shared, props, exec, readTextFile, writeTextFile, watchFolder, settings, home, appHome, notify } from "herdr";
+import { readFile, writeFile, unlink, mkdir } from "fs/promises";
 
 const dirname = (p) => p.replace(/\/[^/]*$/, "") || "/";
 const basename = (p) => p.split("/").pop();
@@ -33,9 +34,20 @@ const fmtTime = (ms) => { const d = new Date(ms), z = (n) => String(n).padStart(
 function hash(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0; return h.toString(36) + str.length.toString(36); }
 
 // 下書き(未保存の本文)。ファイルごとに 1 つ。場所はアプリのルート配下(data/)。
-const draftPath = (t) => `${DRAFT_DIR()}/${hash(`${t.on ?? ""}:${t.file}`)}.json`;
-const writeDraft = (t, text) => exec("sh", ["-c", 'mkdir -p "$1" && printf %s "$3" > "$2"', "sh", DRAFT_DIR(), draftPath(t), JSON.stringify({ file: t.file, on: t.on, base: t.base, text, at: Date.now() })]);
-const dropDraftFile = (t) => exec("rm", ["-f", draftPath(t)]).catch(() => {});
+// 書き込みは fs/promises(exec の引数に本文を載せない: macOS の ARG_MAX 1 MiB を超えると起動に失敗するため)。
+// 書き込みと削除はタブごとの順番待ち(t.q)に並べ、後から頼んだ処理が先に終わって下書きが復活・消失するのを防ぐ。
+function fnv(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h.toString(36); }
+// 2 種類のハッシュを連ねて衝突を避ける(読むときに file と on も照合する)。
+const draftPath = (t) => { const k = `${t.on ?? ""}\n${t.file}`; return `${DRAFT_DIR()}/${hash(k)}${fnv(k)}.json`; };
+const enqueue = (t, fn) => { const r = (t.q ?? Promise.resolve()).then(fn); t.q = r.catch(() => {}); return r; };
+// base は本文でなくハッシュで持つ(本文を二重に持つと JSON が倍になり、読み込みの上限 1 MiB を超えるため)。
+const writeDraft = (t, text) => enqueue(t, async () => {
+  await mkdir(DRAFT_DIR(), { recursive: true });
+  await writeFile(draftPath(t), JSON.stringify({ file: t.file, on: t.on, base: hash(t.base ?? ""), text, at: Date.now() }));
+});
+const dropDraftFile = (t) => enqueue(t, () => unlink(draftPath(t))).catch(() => {});
+// このタブの下書きの状態を全部捨てる(保存・読み直し・破棄)。世代を進めて、実行中の書き込みや確認の結果を無効にする。
+function forgetDraft(t) { t.dgen++; t.draft = null; t.draftText = null; t.draftPending = null; return dropDraftFile(t); }
 
 // フェンス(```lang ... ```)で本文とコードに分ける。行頭から始まるフェンスだけが対象(リスト内などは TextView に任せる)。
 function parse(text) {
@@ -83,7 +95,8 @@ function editorState(file, text) {
 // タブ 1 つ分の状態。base は最後に読み込んだ/保存したディスクの内容(競合検出の expected)。
 const newTab = (file, on) => ({
   file, on: on ?? null, state: null, base: null, dirty: false, conflict: null, error: null, notice: null,
-  saving: false, armed: false, mode: isMd(file) ? "view" : "edit", segs: [], builtFrom: null, draft: null, draftText: null,
+  saving: false, armed: false, mode: isMd(file) ? "view" : "edit", segs: [], builtFrom: null,
+  draft: null, draftText: null, draftPending: null, dgen: 0, q: null, // 下書き: 提案中 / 書き込み済みの本文 / 書き込み中の本文 / 世代 / 順番待ち
 });
 
 export default class FilesEditor extends View {
@@ -210,41 +223,54 @@ export default class FilesEditor extends View {
   // --- 下書き ---
   // 開いたとき、前回未保存のまま閉じた編集(ディスクの内容と違う下書き)があれば、復元を提案する。
   async checkDraft(t, cx) {
-    let raw; try { raw = await readTextFile(draftPath(t)); } catch { return; }
-    if (!raw) return;
-    let d; try { d = JSON.parse(raw); } catch { return; }
-    if (typeof d.text !== "string" || d.text === t.base) { dropDraftFile(t); return; }
-    t.draft = { text: d.text, at: d.at, stale: d.base !== t.base };
+    const gen = t.dgen; // 読んでいる間に保存・破棄・読み直しがあれば、結果は捨てる
+    let d; try { d = JSON.parse(await readFile(draftPath(t), "utf8")); } catch { return; }
+    if (t.dgen !== gen) return;
+    if (d.file !== t.file || (d.on ?? null) !== t.on) return; // ハッシュが衝突した別のファイルの下書き
+    if (typeof d.text !== "string" || d.text === t.base) { forgetDraft(t); return; }
+    t.draft = { text: d.text, at: d.at, stale: d.base !== hash(t.base ?? "") };
     cx.notify();
   }
 
-  // 編集中のタブの下書きを、変わったときだけ書く。未編集に戻ったら消す。提案中の下書きは上書きしない。
+  // 下書きを書く。成功したときだけ「書き込み済み」にする(失敗なら次の周期でやり直す)。
+  async saveDraft(t, text) {
+    const gen = t.dgen;
+    t.draftPending = text;
+    try { await writeDraft(t, text); if (t.dgen === gen) t.draftText = text; return true; }
+    catch { return false; }
+    finally { if (t.draftPending === text) t.draftPending = null; }
+  }
+
+  // 編集中のタブの下書きを、変わったときだけ書く。未編集に戻ったら消す。
+  // 復元バナーが出ている間の編集も書く(閉じても新しい編集を失わないため。古い提案はこの画面の間だけ復元できる)。
   flushDrafts(_cx) {
     for (const t of this.tabs) {
-      if (!t.state || t.draft) continue;
+      if (!t.state) continue;
       if (t.dirty) {
         const text = t.state.value();
-        if (text !== t.draftText && utf8Length(text) <= REMOTE_MAX_BYTES) { t.draftText = text; writeDraft(t, text).catch(() => { t.draftText = null; }); }
-      } else if (t.draftText !== null) { t.draftText = null; dropDraftFile(t); }
+        if (text !== t.draftText && text !== t.draftPending) this.saveDraft(t, text);
+      } else if (t.draftText !== null || t.draftPending !== null) forgetDraft(t);
     }
   }
 
   restoreDraft(t, cx) {
     t.state.set_value(t.draft.text);
-    t.draftText = t.draft.text; t.draft = null;
+    t.draft = null; t.draftText = null; // ファイルには別の編集が残っているかもしれないので、次の周期で書き直す
     t.dirty = t.state.value() !== t.base;
     if (t.mode === "view") this.rebuild(t, cx);
     cx.notify();
   }
 
-  dropDraft(t, cx) { t.draft = null; dropDraftFile(t); cx.notify(); }
+  dropDraft(t, cx) { forgetDraft(t); cx.notify(); } // 編集中なら、次の周期で現在の編集を書き直す
 
-  // ペインが閉じるとき(最後の呼び出し。250 ms まで)。未保存の編集が下書きに残ったことを知らせる。
+  // ペインが閉じるとき(最後の呼び出し。250 ms まで)。未保存の編集が下書きに残ったかを知らせる(書けなかったときはそう伝える)。
   async close(_cx) {
     const dirty = (this.tabs ?? []).filter((t) => t.state && t.dirty);
     if (!dirty.length) return;
-    await Promise.all(dirty.map((t) => { const text = t.state.value(); return text === t.draftText || t.draft ? null : writeDraft(t, text).catch(() => {}); }));
-    notify({ title: "未保存の編集を下書きに残しました", body: `${dirty.map((t) => basename(t.file)).join(", ")} — 次に開くと復元できます`, level: "warning" });
+    const ok = await Promise.all(dirty.map((t) => { const text = t.state.value(); return text === t.draftText ? true : this.saveDraft(t, text); }));
+    const names = (keep) => dirty.filter((_, i) => ok[i] === keep).map((t) => basename(t.file)).join(", ");
+    if (ok.some(Boolean)) notify({ title: "未保存の編集を下書きに残しました", body: `${names(true)} — 次に開くと復元できます`, level: "warning" });
+    if (ok.some((x) => !x)) notify({ title: "未保存の編集を下書きに残せませんでした", body: names(false), level: "error" });
   }
 
   // --- タブ操作 ---
@@ -269,7 +295,7 @@ export default class FilesEditor extends View {
   closeTab(i, cx) {
     const t = this.tabs[i];
     if (t.dirty && !t.armed) { t.armed = true; cx.notify(); return; }
-    if (t.dirty) dropDraftFile(t); // 「破棄」を選んだので、下書きも残さない
+    if (t.dirty) forgetDraft(t); // 「破棄」を選んだので、下書きも残さない
     t.state?.release(); this.release(t.segs);
     this.tabs.splice(i, 1);
     this.active = Math.min(this.active > i ? this.active - 1 : this.active, Math.max(this.tabs.length - 1, 0));
@@ -314,7 +340,7 @@ export default class FilesEditor extends View {
     cx.spawn(async (cx) => {
       try {
         await this.persist(t, text, expected);
-        t.base = text; t.dirty = t.state.value() !== text; t.draft = null; t.draftText = null; dropDraftFile(t);
+        t.base = text; t.dirty = t.state.value() !== text; forgetDraft(t);
       } catch (e) {
         if (e instanceof Stale) t.conflict = e.message; else t.notice = `保存できません: ${String(e.message ?? e)}`;
       } finally { t.saving = false; cx.notify(); }
@@ -327,7 +353,7 @@ export default class FilesEditor extends View {
       try {
         const disk = await readTextFile(t.file, { on: t.on });
         if (disk === null) { t.notice = "ファイルが削除されています"; return; }
-        t.base = disk; t.state.set_value(disk); t.dirty = false; t.conflict = null; t.notice = null; t.draft = null; t.draftText = null; dropDraftFile(t);
+        t.base = disk; t.state.set_value(disk); t.dirty = false; t.conflict = null; t.notice = null; forgetDraft(t);
         if (t.mode === "view") this.rebuild(t, cx);
       } catch (e) { t.notice = `読み込めません: ${String(e)}`; }
       finally { cx.notify(); }
@@ -341,7 +367,7 @@ export default class FilesEditor extends View {
       try {
         const disk = await readTextFile(t.file, { on: t.on });
         await this.persist(t, text, disk);
-        t.base = text; t.dirty = t.state.value() !== text; t.conflict = null; t.notice = null; t.draft = null; t.draftText = null; dropDraftFile(t);
+        t.base = text; t.dirty = t.state.value() !== text; t.conflict = null; t.notice = null; forgetDraft(t);
       } catch (e) { t.notice = `上書きできません: ${String(e.message ?? e)}`; }
       finally { t.saving = false; cx.notify(); }
     });
