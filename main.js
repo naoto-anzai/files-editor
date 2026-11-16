@@ -187,16 +187,16 @@ export default class FilesEditor extends View {
   // コードブロック: 言語名とコピーボタンの帯 + 色付きの行(折り返す。内側でスクロールしない)。
   codeBlock(g, i, mock, t) {
     const pal = { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 };
-    const key = `code-${i}`, copied = this.copied === key;
+    const key = `${this.active}:${i}`, copied = this.copied?.key === key; // タブごと・ブロックごと
     const copy = (_e, cx) => {
       if (mock) return;
       cx.write_to_clipboard(g.body);
-      this.copied = key; cx.notify();
-      cx.spawn(async (cx) => { await exec("sleep", ["1.5"]); if (this.copied === key) { this.copied = null; cx.notify(); } });
+      const gen = this.copyGen = (this.copyGen ?? 0) + 1; this.copied = { key, gen }; cx.notify();
+      cx.spawn(async (cx) => { await exec("sleep", ["1.5"]); if (this.copied?.gen === gen) { this.copied = null; cx.notify(); } });
     };
     const piece = ([text, k]) => div().text_color(k ? pal[k] : t.foreground).child(text);
     // 長いトークンも収まるよう 40 文字ごとに分ける。
-    const chunk = (tok) => (tok[0].length > 40 && !/\s/.test(tok[0])) ? tok[0].match(/[\s\S]{1,40}/g).map((x) => [x, tok[1]]) : [tok];
+    const chunk = (tok) => (tok[0].length > 40 && !/\s/.test(tok[0])) ? tok[0].match(/[\s\S]{1,40}/gu).map((x) => [x, tok[1]]) : [tok];
     return v_flex().id(`fe-code-${i}`).flex_none().rounded(6).overflow_hidden().border_1().border_color(t.border).bg(t.chrome)
       .child(h_flex().h(24).flex_none().px(10).items_center().text_size(11).text_color(t.dim)
         .child(div().flex_1().child(g.lang || "text"))
