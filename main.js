@@ -42,14 +42,64 @@ function parse(text) {
   return out;
 }
 
-// EditorState は render では作れない(init かイベント・async のコールバック内)。ハイライト付きの読み取り専用エディタ。
-function codeState(body, lang) {
-  const t = theme();
-  return EditorState.new({ language: LANG[lang] ?? (lang || "txt"), readonly: true, value: body,
-    line_numbers: false, folding: false, soft_wrap: false, font_family: settings().font_family, font_size: 12,
-    syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
+// ---- コードブロックの自前ハイライト(Editor を使わない: 高さが自動・折り返し・スクロールなし・ホイールは外側へ) ----
+const KW = (s) => new Set(s.split(" "));
+const HL = {
+  js: { alias: "js ts tsx jsx mjs cjs mts cts javascript typescript", line: "//", block: true, q: "\"'`",
+    kw: KW("const let var function return if else for while do switch case break continue new class extends import from export default async await try catch finally throw typeof instanceof in of this super static get set yield void delete interface type enum implements public private protected readonly as"),
+    consts: KW("true false null undefined NaN Infinity") },
+  py: { alias: "py python", line: "#", triple: true, q: "\"'",
+    kw: KW("def class return if elif else for while in not and or is import from as with try except finally raise pass break continue lambda yield global nonlocal async await del assert self"),
+    consts: KW("True False None") },
+  sh: { alias: "sh bash zsh shell fish", line: "#", q: "\"'",
+    kw: KW("if then else elif fi for while until do done case esac function in return export local set unset source exit cd"), consts: KW("true false") },
+  c: { alias: "c cpp c++ h hpp rust rs go java kotlin kt swift cs csharp php", line: "//", block: true, q: "\"'",
+    kw: KW("if else for while do switch case break continue return fn let mut const static struct enum impl trait pub use mod match loop func package import type var interface class new public private protected void int long char float double bool string self this extends implements throw try catch finally"),
+    consts: KW("true false null nil None NULL") },
+  json: { alias: "json jsonc json5", line: "//", block: true, q: "\"", kw: new Set(), consts: KW("true false null"), keys: true },
+  yaml: { alias: "yaml yml toml ini", line: "#", q: "\"'", kw: new Set(), consts: KW("true false null yes no on off"), keys: true },
+  html: { alias: "html xml svg vue svelte", q: "\"'", tags: true, kw: new Set(), consts: new Set() },
+};
+const HL_BY = {};
+for (const [fam, c] of Object.entries(HL)) for (const a of c.alias.split(" ")) HL_BY[a] = fam;
+const reEsc = (x) => x.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
+const HL_RE = {};
+function hlRegex(fam) {
+  if (HL_RE[fam]) return HL_RE[fam];
+  const c = HL[fam], parts = [];
+  if (c.tags) parts.push(["comment", "<!--[\\s\\S]*?(?:-->|$)"]);
+  if (c.block) parts.push(["comment", "\\/\\*[\\s\\S]*?(?:\\*\\/|$)"]);
+  if (c.line) parts.push(["comment", reEsc(c.line) + "[^\\n]*"]);
+  if (c.triple) parts.push(["string", "\"\"\"[\\s\\S]*?(?:\"\"\"|$)|'''[\\s\\S]*?(?:'''|$)"]);
+  for (const q of c.q) parts.push(["string", q === "`" ? "`(?:\\\\[\\s\\S]|[^`\\\\])*`?" : `${q}(?:\\\\[\\s\\S]|[^${q}\\\\\\n])*${q}?`]);
+  if (c.tags) parts.push(["keyword", "<\\/?[A-Za-z][\\w:-]*"]);
+  parts.push(["number", "\\b(?:0[xX][\\da-fA-F_]+|\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b"]);
+  parts.push(["word", "[A-Za-z_$][\\w$]*"]);
+  return (HL_RE[fam] = { kinds: parts.map((x) => x[0]), re: new RegExp(parts.map((x) => `(${x[1]})`).join("|"), "g") });
 }
-const codeHeight = (body) => body.split("\n").length * 18 + 16; // Editor は高さを自動で決めない
+// 本文を [[文字列, 種別|null], ...] の行の配列にする(種別: keyword string comment function type number constant)。
+function highlight(body, lang) {
+  if (lang === "diff" || lang === "patch") {
+    return body.split("\n").map((l) => [[l, l.startsWith("+") ? "string" : l.startsWith("-") ? "number" : l.startsWith("@@") ? "function" : null]]);
+  }
+  if (!HL_BY[lang]) return body.split("\n").map((l) => [[l, null]]);
+  const fam = HL_BY[lang], c = HL[fam], { kinds, re } = hlRegex(fam), toks = [];
+  let last = 0, m; re.lastIndex = 0;
+  while ((m = re.exec(body))) {
+    if (m[0] === "") { re.lastIndex++; continue; }
+    if (m.index > last) toks.push([body.slice(last, m.index), null]);
+    let k = kinds[m.slice(1).findIndex((x) => x !== undefined)];
+    if (k === "word") {
+      const w = m[0], rest = body.slice(re.lastIndex).match(/^[ \t]*(.)/);
+      k = c.kw.has(w) ? "keyword" : c.consts.has(w) ? "constant" : /^[A-Z]/.test(w) ? "type" : rest && rest[1] === "(" ? "function" : null;
+    } else if (k === "string" && c.keys && /^[ \t]*:/.test(body.slice(re.lastIndex))) k = "function";
+    toks.push([m[0], k]); last = re.lastIndex;
+  }
+  if (last < body.length) toks.push([body.slice(last), null]);
+  const rows = [[]];
+  for (const [text, k] of toks) text.split("\n").forEach((part, j) => { if (j > 0) rows.push([]); if (part) rows[rows.length - 1].push([part, k]); });
+  return rows;
+}
 
 // 相対パスを file のあるフォルダ基準で解決する(. と .. を畳む)。
 function resolve(base, rel) {
@@ -96,10 +146,10 @@ export default class FilesEditor extends View {
 
   get cur() { return this.tabs[this.active] ?? null; }
 
-  // 本文をセグメントに分け、コードには Editor の状態を作る(変換はここでは始めない)。
+  // 本文をセグメントに分け、コードにはハイライト済みの行を作る(変換はここでは始めない)。
   build(text) {
     const segs = parse(text);
-    for (const g of segs) if (g.type === "code") g.state = codeState(g.body, g.lang);
+    for (const g of segs) if (g.type === "code") g.rows = highlight(g.body, g.lang);
     return segs;
   }
 
@@ -134,11 +184,31 @@ export default class FilesEditor extends View {
     });
   }
 
+  // コードブロック: 言語名とコピーボタンの帯 + 色付きの行(折り返す。内側でスクロールしない)。
+  codeBlock(g, i, mock, t) {
+    const pal = { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 };
+    const key = `code-${i}`, copied = this.copied === key;
+    const copy = (_e, cx) => {
+      if (mock) return;
+      cx.write_to_clipboard(g.body);
+      this.copied = key; cx.notify();
+      cx.spawn(async (cx) => { await exec("sleep", ["1.5"]); if (this.copied === key) { this.copied = null; cx.notify(); } });
+    };
+    const piece = ([text, k]) => div().text_color(k ? pal[k] : t.foreground).child(text);
+    // 長いトークンも収まるよう 40 文字ごとに分ける。
+    const chunk = (tok) => (tok[0].length > 40 && !/\s/.test(tok[0])) ? tok[0].match(/[\s\S]{1,40}/g).map((x) => [x, tok[1]]) : [tok];
+    return v_flex().id(`fe-code-${i}`).flex_none().rounded(6).overflow_hidden().border_1().border_color(t.border).bg(t.chrome)
+      .child(h_flex().h(24).flex_none().px(10).items_center().text_size(11).text_color(t.dim)
+        .child(div().flex_1().child(g.lang || "text"))
+        .child(div().id(`fe-copy-${i}`).px(6).rounded(4).cursor_pointer().hover((s) => s.opacity(0.8)).on_click(copy).child(copied ? "コピーしました" : "コピー")))
+      .child(v_flex().px(10).pb(8).font_family(settings().font_family).text_size(12)
+        .children(g.rows.map((row) => h_flex().flex_wrap().children(row.length ? row.flatMap(chunk).map(piece) : [div().child(" ")]))));
+  }
+
   segments(segs, mock, t) {
     return segs.map((g, i) => {
       if (g.type === "code") {
-        return div().id(`fe-code-${i}`).h(codeHeight(g.body)).flex_none().rounded(6).overflow_hidden().border_1().border_color(t.border)
-          .child(Editor.new(g.state));
+        return this.codeBlock(g, i, mock, t);
       }
       if (g.type === "mermaid") {
         const m = mock ? { status: "mock" } : this.mermaid.get(g.hash) ?? { status: "pending" };
@@ -147,7 +217,7 @@ export default class FilesEditor extends View {
         return div().id(`fe-mm-${i}`).flex_none().p(8).rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.dim)
           .child(div().child(note)).child(div().mt(4).text_color(t.muted).child(g.src));
       }
-      return TextView.markdown(`fe-md-${i}`, g.text).selectable(true).on_link_click((url, cx) => this.link(url, cx));
+      return TextView.markdown(`fe-md-${i}`, g.text).flex_none().selectable(true).on_link_click((url, cx) => this.link(url, cx)); // flex_none: 縮むとスクロール領域が内容より小さく見えてスクロールできない
     });
   }
 
@@ -355,7 +425,7 @@ export default class FilesEditor extends View {
       .child(v.error
         ? div().p(12).text_color(t.dim).child(v.error)
         : viewing
-          ? div().id("fe-md-scroll").flex_1().min_h(0).overflow_scrollbar().p(16).flex().flex_col().gap(8)
+          ? div().id("fe-md-scroll").flex_1().min_h(0).overflow_y_scrollbar().p(16).flex().flex_col().gap(8)
               .children(this.segments(v.segs, mock, t))
           : v.state ? Editor.new(v.state).flex_1().min_h(0) : div().p(12).text_color(t.dim).child("読み込み中…"));
   }
