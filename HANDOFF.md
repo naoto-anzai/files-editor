@@ -1,17 +1,41 @@
-# files-editor 引き継ぎ(md-viewer のセッション t2y からの依頼を、t3v が転記)
+# files-editor 引き継ぎ
 
-## 目的
-Files(同梱 files の clone)の拡張として、Markdown などのテキストを実際に「編集」できるようにする Mod。
-今の md-viewer(閲覧専用・ペイン内タブ)とは切り離して、このセッションで進める。
+herdr-app の Mod。テキストファイルを編集して保存する、タブ付きのペイン。
 
-## 既存
-- ~/Projects/herdr-mods/md-viewer(naoto-anzai/md-viewer): props {file, on, viewer} を受け取り、ペイン内タブで Markdown を表示する閲覧専用 Mod。
-- ~/.config/herdr-app/mods/files-md = 同梱 files の clone。.md を選ぶと md-viewer のタブで開く(git 管理外。layouts/mine.json の Files 参照をこれに向けてある)。
+## できること(実装済み・実機で確認済み)
+- props `{file, on, viewer}` を受けて開く。`file` は絶対パス、`on` はマシン名(リモート)、`viewer` は Files がこのペインを特定する ID。
+- タブ列(未保存の●、未保存タブは × → 「破棄?」の 2 段階で閉じる)。
+- `.md` は既定が「表示」(整形)、「編集」(ソース)とトグル。相対リンクの `.md` は新しいタブ、`http` は `open`。
+- 保存(ヘッダーのボタン / Cmd+S)。
+  - ローカル: `writeTextFile(path, text, expected)`。`expected` は読み込んだ時点の内容。
+  - リモート(`on` あり): 読み直して比較 → `hc file write --on <マシン>` で書く → 読み戻して照合。
+    本文はローカルの `sh` の引数にだけ載せ、リモートへは標準入力で送る(リモート Linux の 1 引数 128 KiB 上限を避ける。500 KiB まで確認)。
+    比較から書き込みまでの間の変更は拾えない(ローカルより弱い)。上限は 800 KiB。
+- 競合: 未編集なら外部変更を黙って読み直す。編集中・削除されたときはバナー
+  (「ディスクの内容を読み込む」/「上書き保存」/「再作成して保存」)。編集は失わない。
+- 1 MiB 超などで読めないファイルは開かない(切り詰めて上書きする事故を避けるため)。バイナリは開かない。
 
-## 守ること
-- 同梱 Mod は直接編集しない(mod.clone で複製)。
-- 画面を持つ Mod は storybook.json と main.js 内のモックを必ず合わせる(~/Projects/herdr-mods/CLAUDE.md 参照)。
-- 編集機能の設計(Files の clone を拡張するか、別 Mod にするか、保存・競合・リモート対応 `on`)は、このセッションで検討する。
-- 画面の挙動が変わる操作(layout 切替、Files の差し替え)は、実行前にユーザーへ報告する。
-- md-viewer 側は触らない。必要なら md-viewer のセッション(t2y)に相談する。
-- GitHub のリポジトリは、まだ作っていない(公開リポジトリは、ユーザーの了承待ち)。push しない。
+## Files からの入口
+同梱 `files` の clone(`files-md`、`layouts/mine.json` が参照)が、クリックしたテキストを files-editor のタブで開く。
+画像・zip などバイナリだけは Files 内の読み取り専用プレビュー。
+shared のキー: `files-editor:pane:<pane>`(ペイン → viewer ID)/ `files-editor:open:<viewer>` = `{file,on,seq}` / `files-editor:pending`(結び付け待ち)。
+`files-md` は git 管理外(`~/.config/herdr-app/mods/files-md`)。元の版は `main.js.before-files-editor`。
+
+## md-viewer との関係
+files-editor の「表示」は、md-viewer の方式(`TextView.markdown(...).selectable(true).on_link_click`)を写したもの。
+md-viewer は別 Mod・別リポジトリで、Markdown のレンダリング改善は md-viewer 側の担当。
+Mod 同士は import できないので、改善を files-editor に反映するには手で写す(`render()` 内の `fe-md-scroll` の数行)。
+
+## 既知の制約・未確認
+- 保存失敗の表示(権限のないファイルなど)は実機で未確認(モックでは確認済み)。
+- ペインはコードを直しても入れ替わらない。直したあとは閉じて開き直す。
+- 保存せずにペインを閉じると、警告なしで編集が失われる(`close()` は 250 ms の制限で確認ダイアログを出せない)。
+- Windows のリモートは未確認。
+
+## Story(モック)
+`storybook.json` と `main.js` 末尾の `STORYBOOK MOCK` が対。状態は `status`(保存状態)、`tabs`、`view`。
+状態が増減したら両方を同時に直す(契約: `~/Projects/herdr-mods/ModsStoryBook/STORYBOOK.md`)。
+
+## 開発
+- `herdr-app check ~/.config/herdr-app/mods/files-editor` と `herdr-app shot` で確認する。
+- 同梱 Mod / layout は直接編集しない(`mod.clone` / `layout.clone`)。
