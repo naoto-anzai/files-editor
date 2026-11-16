@@ -6,10 +6,12 @@
 // - 1 MiB 超などで読めないファイルは開かない(一部だけ読んで全体を上書きする事故を避けるため、切り詰めない)。
 // - 「表示」では、行頭の ``` フェンスのコードを読み取り専用 Editor でハイライトし、```mermaid は mermaid-cli で SVG にして図で出す
 //   (md-viewer からの移植。導入: setup-mermaid.sh。リモートのファイルの図も変換はこの computer で行う)。
+// - 未保存の編集: ペインを閉じる操作は止められないので、編集中は 2 秒ごとに「下書き」を data/files-editor/drafts/ に保存し、
+//   未保存のまま閉じたら通知、次に開いたときに「復元 / 破棄」を出す。
 // - Files からの「ここで開く」依頼: shared("files-editor:open:<viewer>") = {file, on, seq}(Files = files-md が書く)。
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
-import { theme, shared, props, exec, readTextFile, writeTextFile, watchFolder, settings, home, appHome } from "herdr";
+import { theme, shared, props, exec, readTextFile, writeTextFile, watchFolder, settings, home, appHome, notify } from "herdr";
 
 const dirname = (p) => p.replace(/\/[^/]*$/, "") || "/";
 const basename = (p) => p.split("/").pop();
@@ -24,8 +26,16 @@ class Stale extends Error {}
 const MAX_MD = 400000;        // 「表示」に渡す本文の上限(超えた分は省略。編集・保存には影響しない)
 const MAX_CODE_BLOCKS = 40;
 const MERMAID_DIR = () => `${home()}/.local/share/md-viewer-mermaid`; // mermaid-cli の置き場(setup-mermaid.sh)
+const DRAFT_DIR = () => `${appHome()}/data/files-editor/drafts`;
+
+const fmtTime = (ms) => { const d = new Date(ms), z = (n) => String(n).padStart(2, "0"); return `${d.getMonth() + 1}/${d.getDate()} ${z(d.getHours())}:${z(d.getMinutes())}`; };
 
 function hash(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0; return h.toString(36) + str.length.toString(36); }
+
+// 下書き(未保存の本文)。ファイルごとに 1 つ。場所はアプリのルート配下(data/)。
+const draftPath = (t) => `${DRAFT_DIR()}/${hash(`${t.on ?? ""}:${t.file}`)}.json`;
+const writeDraft = (t, text) => exec("sh", ["-c", 'mkdir -p "$1" && printf %s "$3" > "$2"', "sh", DRAFT_DIR(), draftPath(t), JSON.stringify({ file: t.file, on: t.on, base: t.base, text, at: Date.now() })]);
+const dropDraftFile = (t) => exec("rm", ["-f", draftPath(t)]).catch(() => {});
 
 // フェンス(```lang ... ```)で本文とコードに分ける。行頭から始まるフェンスだけが対象(リスト内などは TextView に任せる)。
 function parse(text) {
@@ -73,7 +83,7 @@ function editorState(file, text) {
 // タブ 1 つ分の状態。base は最後に読み込んだ/保存したディスクの内容(競合検出の expected)。
 const newTab = (file, on) => ({
   file, on: on ?? null, state: null, base: null, dirty: false, conflict: null, error: null, notice: null,
-  saving: false, armed: false, mode: isMd(file) ? "view" : "edit", segs: [], builtFrom: null,
+  saving: false, armed: false, mode: isMd(file) ? "view" : "edit", segs: [], builtFrom: null, draft: null, draftText: null,
 });
 
 export default class FilesEditor extends View {
@@ -91,6 +101,7 @@ export default class FilesEditor extends View {
       for (const [k, text] of Object.entries(MOCK_DOCS)) { this.mockEdits[k] = editorState("sample.md", text); this.mockSegs[k] = this.build(text); }
       return;
     }
+    cx.timer.every(2000, (cx) => this.flushDrafts(cx));
     if (this.tabs[0]) { this.load(this.tabs[0], cx); this.watchActive(cx); }
   }
 
@@ -167,6 +178,7 @@ export default class FilesEditor extends View {
     t.base = text; t.dirty = false; t.conflict = null; t.error = null;
     t.state = editorState(t.file, text);
     if (t.mode === "view") this.rebuild(t, cx);
+    this.checkDraft(t, cx);
     t.state.on("change", (_e, cx) => { t.dirty = t.state.value() !== t.base; t.armed = false; cx.notify(); });
   }
 
@@ -195,6 +207,46 @@ export default class FilesEditor extends View {
     cx.notify();
   }
 
+  // --- 下書き ---
+  // 開いたとき、前回未保存のまま閉じた編集(ディスクの内容と違う下書き)があれば、復元を提案する。
+  async checkDraft(t, cx) {
+    let raw; try { raw = await readTextFile(draftPath(t)); } catch { return; }
+    if (!raw) return;
+    let d; try { d = JSON.parse(raw); } catch { return; }
+    if (typeof d.text !== "string" || d.text === t.base) { dropDraftFile(t); return; }
+    t.draft = { text: d.text, at: d.at, stale: d.base !== t.base };
+    cx.notify();
+  }
+
+  // 編集中のタブの下書きを、変わったときだけ書く。未編集に戻ったら消す。提案中の下書きは上書きしない。
+  flushDrafts(_cx) {
+    for (const t of this.tabs) {
+      if (!t.state || t.draft) continue;
+      if (t.dirty) {
+        const text = t.state.value();
+        if (text !== t.draftText && utf8Length(text) <= REMOTE_MAX_BYTES) { t.draftText = text; writeDraft(t, text).catch(() => { t.draftText = null; }); }
+      } else if (t.draftText !== null) { t.draftText = null; dropDraftFile(t); }
+    }
+  }
+
+  restoreDraft(t, cx) {
+    t.state.set_value(t.draft.text);
+    t.draftText = t.draft.text; t.draft = null;
+    t.dirty = t.state.value() !== t.base;
+    if (t.mode === "view") this.rebuild(t, cx);
+    cx.notify();
+  }
+
+  dropDraft(t, cx) { t.draft = null; dropDraftFile(t); cx.notify(); }
+
+  // ペインが閉じるとき(最後の呼び出し。250 ms まで)。未保存の編集が下書きに残ったことを知らせる。
+  async close(_cx) {
+    const dirty = (this.tabs ?? []).filter((t) => t.state && t.dirty);
+    if (!dirty.length) return;
+    await Promise.all(dirty.map((t) => { const text = t.state.value(); return text === t.draftText || t.draft ? null : writeDraft(t, text).catch(() => {}); }));
+    notify({ title: "未保存の編集を下書きに残しました", body: `${dirty.map((t) => basename(t.file)).join(", ")} — 次に開くと復元できます`, level: "warning" });
+  }
+
   // --- タブ操作 ---
   // 同じファイルが開いていればそのタブへ、なければ新しいタブを足して切り替える。
   openTab(file, on, cx) {
@@ -217,6 +269,7 @@ export default class FilesEditor extends View {
   closeTab(i, cx) {
     const t = this.tabs[i];
     if (t.dirty && !t.armed) { t.armed = true; cx.notify(); return; }
+    if (t.dirty) dropDraftFile(t); // 「破棄」を選んだので、下書きも残さない
     t.state?.release(); this.release(t.segs);
     this.tabs.splice(i, 1);
     this.active = Math.min(this.active > i ? this.active - 1 : this.active, Math.max(this.tabs.length - 1, 0));
@@ -261,7 +314,7 @@ export default class FilesEditor extends View {
     cx.spawn(async (cx) => {
       try {
         await this.persist(t, text, expected);
-        t.base = text; t.dirty = t.state.value() !== text;
+        t.base = text; t.dirty = t.state.value() !== text; t.draft = null; t.draftText = null; dropDraftFile(t);
       } catch (e) {
         if (e instanceof Stale) t.conflict = e.message; else t.notice = `保存できません: ${String(e.message ?? e)}`;
       } finally { t.saving = false; cx.notify(); }
@@ -274,7 +327,7 @@ export default class FilesEditor extends View {
       try {
         const disk = await readTextFile(t.file, { on: t.on });
         if (disk === null) { t.notice = "ファイルが削除されています"; return; }
-        t.base = disk; t.state.set_value(disk); t.dirty = false; t.conflict = null; t.notice = null;
+        t.base = disk; t.state.set_value(disk); t.dirty = false; t.conflict = null; t.notice = null; t.draft = null; t.draftText = null; dropDraftFile(t);
         if (t.mode === "view") this.rebuild(t, cx);
       } catch (e) { t.notice = `読み込めません: ${String(e)}`; }
       finally { cx.notify(); }
@@ -288,7 +341,7 @@ export default class FilesEditor extends View {
       try {
         const disk = await readTextFile(t.file, { on: t.on });
         await this.persist(t, text, disk);
-        t.base = text; t.dirty = t.state.value() !== text; t.conflict = null; t.notice = null;
+        t.base = text; t.dirty = t.state.value() !== text; t.conflict = null; t.notice = null; t.draft = null; t.draftText = null; dropDraftFile(t);
       } catch (e) { t.notice = `上書きできません: ${String(e.message ?? e)}`; }
       finally { t.saving = false; cx.notify(); }
     });
@@ -313,7 +366,7 @@ export default class FilesEditor extends View {
       names: this.tabs.map((x) => ({ name: basename(x.file), dirty: x.dirty, armed: x.armed })), active: this.active,
       file: c?.file ?? null, on: c?.on ?? null, error: c ? c.error : "開いているファイルはありません", state: c?.state ?? null,
       dirty: c?.dirty ?? false, conflict: c?.conflict ?? null, notice: c?.notice ?? null, saving: c?.saving ?? false,
-      mode: c?.mode ?? "edit", isMd: c ? isMd(c.file) : false, segs: c?.segs ?? [],
+      mode: c?.mode ?? "edit", isMd: c ? isMd(c.file) : false, segs: c?.segs ?? [], draft: c?.draft ?? null,
     };
     // モック中はクリックしても何も起きない(実ファイルに触れない)。
     const act = (fn) => (cx) => { if (!mock) fn(cx); };
@@ -345,6 +398,12 @@ export default class FilesEditor extends View {
           .child(this.button(t, "fe-mode-view", "表示", setMode("view"), { primary: viewing }))
           .child(this.button(t, "fe-mode-edit", "編集", setMode("edit"), { primary: !viewing }))))
         .when(!v.error, (el) => el.child(this.button(t, "fe-save", "保存", act((cx) => this.save(this.cur, cx)), { primary: true, enabled: v.dirty && !v.conflict && !v.saving }))))
+      // 前回、未保存のまま閉じた編集の下書き(復元を提案)。
+      .when(Boolean(v.draft), (el) => el.child(v_flex().flex_none().px(12).py(8).gap(8).bg(t.raised).border_b(1).border_color(t.border)
+        .child(div().text_size(12).text_color(t.blocked).child(`未保存の編集が下書きに残っています(${fmtTime(v.draft.at)})${v.draft.stale ? " ・ ファイルはその後に変更されています" : ""}`))
+        .child(h_flex().gap(8).flex_wrap()
+          .child(this.button(t, "fe-draft-restore", "下書きを復元", act((cx) => this.restoreDraft(this.cur, cx))))
+          .child(this.button(t, "fe-draft-drop", "破棄", act((cx) => this.dropDraft(this.cur, cx)))))))
       // 細いペインでも崩れないよう、メッセージの行とボタンの行を分ける。
       .when(Boolean(v.conflict), (el) => el.child(v_flex().flex_none().px(12).py(8).gap(8).bg(t.raised).border_b(1).border_color(t.border)
         .child(div().text_size(12).text_color(t.blocked).child(v.conflict === "deleted" ? "ディスク上のファイルが削除されました" : "ディスク上のファイルが変更されました"))
@@ -382,9 +441,10 @@ function mockView(sb, self) {
   const many = sb.tabs === "many", file = "/Users/me/project/docs/sample.md";
   const noTabs = sb.status === "empty";
   const names = noTabs ? [] : (many ? MOCK_TABS : ["sample.md"]).map((name, i) => ({ name, dirty: sb.status === "dirty" && i === (many ? 1 : 0), armed: false }));
-  const base = { names, active: many ? 1 : 0, file, on: null, error: null, state: self.mockEdits[sb.doc] ?? self.mockEdits.sample, dirty: false, conflict: null, notice: null, saving: false, mode: sb.view, isMd: true, segs: self.mockSegs[sb.doc] ?? self.mockSegs.sample };
+  const base = { names, active: many ? 1 : 0, file, on: null, error: null, state: self.mockEdits[sb.doc] ?? self.mockEdits.sample, draft: null, dirty: false, conflict: null, notice: null, saving: false, mode: sb.view, isMd: true, segs: self.mockSegs[sb.doc] ?? self.mockSegs.sample };
   switch (sb.status) {
     case "dirty": return { ...base, dirty: true };
+    case "draft": return { ...base, draft: { at: Date.now() - 3600 * 1000, stale: sb.tabs === "many" } };
     case "conflict": return { ...base, dirty: true, conflict: "changed" };
     case "deleted": return { ...base, dirty: true, conflict: "deleted" };
     case "remote": return { ...base, on: "vps", dirty: true };
