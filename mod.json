@@ -1,1 +1,1 @@
-{ "place": "none" }
+{ "place": "none", "title": "Files Editor", "overlay": { "kind": "window", "key": "files-editor", "keep": true, "width": 0.55, "height": 0.8 } }

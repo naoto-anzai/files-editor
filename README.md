@@ -14,7 +14,10 @@
     herdr-app do pane.split --direction right --mod files-editor --props '{"file":"/abs/path/file.md"}'
     # リモートのファイルは "on":"<machine>" を足す
 
-Files からは、同梱 `files` の clone(`files-md`)が `shared("files-editor:open:<viewer>")` に `{file,on,seq}` を書いて開く。
+ショートカット `cmd-shift-e`(`keys.json` の `"mod.open:files-editor"`)で、画面の上に重なるウィンドウとして開閉する(同じキーで閉じる)。ドラッグで動かせ、位置を覚える。
+開いているタブはスペースごとに `shared("files-editor:space:<space>")` に保存され、開き直すと復元する。
+Files からは、同梱 `files` の clone(`files-md`)が、そのスペースの一覧にファイルを足し(あれば足さない)、ウィンドウが閉じていれば開く。
+(ペインとして開く `pane.split` も残してあり、その場合は `shared("files-editor:open:<viewer>")` に `{file,on,seq}` を書いて開く。)
 
 ## 機能
 

@@ -15,7 +15,13 @@ herdr-app の Mod。テキストファイルを編集して保存する、タブ
   (「ディスクの内容を読み込む」/「上書き保存」/「再作成して保存」)。編集は失わない。
 - 1 MiB 超などで読めないファイルは開かない(切り詰めて上書きする事故を避けるため)。バイナリは開かない。
 
-## Files からの入口
+## ウィンドウ運用(既定の入口)
+`mod.json` の `overlay` = `{kind:"window", key:"files-editor", keep:true}`。`cmd-shift-e`(keys.json の global に `mod.open:files-editor`)でトグル。
+shared のキー: `files-editor:space:<space>` = `{files:[{file,on}], active, req:{file,on,seq}}`(スペースごとの開いているタブと、Files からの依頼)/ `files-editor:alive`(開いている印、20 秒ごと更新・30 秒で古いとみなす)。
+ウィンドウは 1 秒ごとに、フォーカス中のスペースへの切り替え、置き場に増えたファイルの取り込み、req の反映を行う。スペースごとの編集状態はメモリに保つ。
+未確認: ウィンドウのドラッグ(タブ・ボタン上から)、再起動後の復元、開いた直後のキーボード入力。
+
+## Files からの入口(ペイン方式。Files は今はウィンドウ方式を使う)
 同梱 `files` の clone(`files-md`、`layouts/mine.json` が参照)が、クリックしたテキストを files-editor のタブで開く。
 画像・zip などバイナリだけは Files 内の読み取り専用プレビュー。
 shared のキー: `files-editor:pane:<pane>`(ペイン → viewer ID)/ `files-editor:open:<viewer>` = `{file,on,seq}` / `files-editor:pending`(結び付け待ち)。

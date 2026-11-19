@@ -8,10 +8,13 @@
 //   (md-viewer からの移植。導入: setup-mermaid.sh。リモートのファイルの図も変換はこの computer で行う)。
 // - 未保存の編集: ペインを閉じる操作は止められないので、編集中は 2 秒ごとに「下書き」を data/files-editor/drafts/ に保存し、
 //   未保存のまま閉じたら通知、次に開いたときに「復元 / 破棄」を出す。
-// - Files からの「ここで開く」依頼: shared("files-editor:open:<viewer>") = {file, on, seq}(Files = files-md が書く)。
+// - Files からの「ここで開く」依頼(ペイン): shared("files-editor:open:<viewer>") = {file, on, seq}(Files = files-md が書く)。
+// - ウィンドウ運用(cmd-shift-e の mod.open でトグル。mod.json の overlay = window): スペースごとの開いているタブを
+//   shared("files-editor:space:<space>") = {files:[{file,on}], active, req} に持ち、Files は無ければ足して req を渡す。
+//   開いている印は shared("files-editor:alive")(20 秒ごと更新)。
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
-import { theme, shared, props, exec, readTextFile, writeTextFile, watchFolder, settings, home, appHome, notify } from "herdr";
+import { theme, shared, props, exec, readTextFile, writeTextFile, watchFolder, settings, home, appHome, notify, setShared, focused } from "herdr";
 import { readFile, writeFile, unlink, mkdir } from "fs/promises";
 
 const dirname = (p) => p.replace(/\/[^/]*$/, "") || "/";
@@ -143,6 +146,10 @@ function editorState(file, text) {
 }
 
 // タブ 1 つ分の状態。base は最後に読み込んだ/保存したディスクの内容(競合検出の expected)。
+// ウィンドウ運用: スペースごとに開いているタブ(と、Files からの「これを開いて」依頼 req)を shared に持つ。
+// files-editor:space:<space> = {files:[{file,on}], active, req:{file,on,seq}} / files-editor:alive = ウィンドウが開いている印(時刻)。
+const SPACE_KEY = (s) => `files-editor:space:${s}`;
+const readStore = (s) => { const v = s ? shared(SPACE_KEY(s)) : null; return v && Array.isArray(v.files) ? v : { files: [], active: 0, req: null }; };
 const newTab = (file, on) => ({
   file, on: on ?? null, state: null, base: null, dirty: false, conflict: null, error: null, notice: null,
   saving: false, armed: false, mode: isMd(file) ? "view" : "edit", segs: [], builtFrom: null,
@@ -153,9 +160,13 @@ export default class FilesEditor extends View {
   init(_props, cx) {
     const p = props() ?? {};
     this.viewer = p.viewer ?? null; // Files がこのペインを特定するための ID
-    this.tabs = p.file ? [newTab(p.file, p.on)] : [];
-    this.active = 0;
-    this.seq = 0;
+    this.win = !!p.overlay && !storybook("files-editor"); // ウィンドウ(mod.open / Files)で開かれた
+    this.sets = new Map(); // スペースごとのタブ(editor の状態ごと)。ウィンドウがスペースをまたいで開いたままでも保つ
+    this.space = this.win ? focused()?.space ?? null : null;
+    const st = this.win ? readStore(this.space) : null;
+    this.tabs = st ? st.files.map((f) => newTab(f.file, f.on)) : p.file ? [newTab(p.file, p.on)] : [];
+    this.active = st ? Math.max(0, Math.min(st.active ?? 0, this.tabs.length - 1)) : 0;
+    this.seq = st?.req?.seq ?? 0; // 起動前の依頼は、保存された active で反映済み
     this.watchGen = 0;
     this.mermaid = new Map(); // hash -> {status: "pending"|"ok"|"error", w, h, rel, error}
     if (storybook("files-editor")) {
@@ -165,10 +176,55 @@ export default class FilesEditor extends View {
       return;
     }
     cx.timer.every(2000, (cx) => this.flushDrafts(cx));
-    if (this.tabs[0]) { this.load(this.tabs[0], cx); this.watchActive(cx); }
+    if (this.win) { this.hb = Date.now(); setShared("files-editor:alive", this.hb); cx.timer.every(1000, (cx) => this.tick(cx)); }
+    for (const t of this.tabs) this.load(t, cx);
+    if (this.tabs.length) this.watchActive(cx);
   }
 
   get cur() { return this.tabs[this.active] ?? null; }
+
+  // --- ウィンドウ運用 ---
+  // 開いているタブの一覧を、いまのスペースの置き場へ書く(req は Files のものなので残す)。
+  store() {
+    if (!this.win || !this.space) return;
+    setShared(SPACE_KEY(this.space), { files: this.tabs.map((t) => ({ file: t.file, on: t.on })), active: this.active, req: readStore(this.space).req });
+  }
+
+  // 1 秒ごと: 開いている印の更新(20 秒ごと)、フォーカス中のスペースが変わったら切り替え、置き場に増えたファイルの取り込み。
+  tick(cx) {
+    if (Date.now() - this.hb > 20000) { this.hb = Date.now(); setShared("files-editor:alive", this.hb); }
+    const sp = focused()?.space;
+    if (sp && sp !== this.space) { this.switchSpace(sp, cx); return; }
+    if (!this.space) return;
+    const st = readStore(this.space);
+    let changed = false;
+    for (const f of st.files) {
+      if (this.tabs.some((t) => t.file === f.file && t.on === (f.on ?? null))) continue;
+      const t = newTab(f.file, f.on); this.tabs.push(t); this.load(t, cx); changed = true; // 無いものだけ足す(あるものは足さない)
+    }
+    const r = st.req;
+    if (r && r.seq > this.seq) {
+      this.seq = r.seq;
+      const i = this.tabs.findIndex((t) => t.file === r.file && t.on === (r.on ?? null));
+      if (i >= 0) { this.active = i; this.watchActive(cx); this.sync(this.tabs[i], cx); changed = true; }
+    }
+    if (changed) { this.store(); cx.notify(); }
+  }
+
+  switchSpace(sp, cx) {
+    this.sets.set(this.space, { tabs: this.tabs, active: this.active });
+    this.space = sp;
+    const mem = this.sets.get(sp), st = readStore(sp);
+    if (mem) { this.tabs = mem.tabs; this.active = mem.active; }
+    else {
+      this.tabs = st.files.map((f) => newTab(f.file, f.on));
+      this.active = Math.max(0, Math.min(st.active ?? 0, this.tabs.length - 1));
+      for (const t of this.tabs) this.load(t, cx);
+    }
+    this.seq = st.req?.seq ?? 0;
+    this.watchActive(cx);
+    cx.notify();
+  }
 
   // 本文をセグメントに分け、コードにはハイライト済みの行を作る(変換はここでは始めない)。
   build(text) {
@@ -335,6 +391,7 @@ export default class FilesEditor extends View {
 
   // ペインが閉じるとき(最後の呼び出し。250 ms まで)。未保存の編集が下書きに残ったかを知らせる(書けなかったときはそう伝える)。
   async close(_cx) {
+    if (this.win) setShared("files-editor:alive", 0); // ウィンドウが閉じた印
     const dirty = (this.tabs ?? []).filter((t) => t.state && t.dirty);
     if (!dirty.length) return;
     const ok = await Promise.all(dirty.map((t) => { const text = t.state.value(); return text === t.draftText ? true : this.saveDraft(t, text); }));
@@ -350,6 +407,7 @@ export default class FilesEditor extends View {
     if (i >= 0) { this.active = i; this.sync(this.tabs[i], cx); }
     else { const t = newTab(file, on); this.tabs.push(t); this.active = this.tabs.length - 1; this.load(t, cx); }
     this.watchActive(cx);
+    this.store();
     cx.notify();
   }
 
@@ -358,6 +416,7 @@ export default class FilesEditor extends View {
     this.active = i;
     this.watchActive(cx);
     this.sync(this.tabs[i], cx);
+    this.store();
     cx.notify();
   }
 
@@ -370,6 +429,7 @@ export default class FilesEditor extends View {
     this.tabs.splice(i, 1);
     this.active = Math.min(this.active > i ? this.active - 1 : this.active, Math.max(this.tabs.length - 1, 0));
     this.watchActive(cx);
+    this.store();
     cx.notify();
   }
 
